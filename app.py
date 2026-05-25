@@ -111,7 +111,11 @@ def _sound_predict(wav_bytes: bytes) -> dict:
     norm = (mel_db - lo) / (hi - lo + 1e-9)
 
     # Apply viridis colormap → RGB uint8 [128, n_frames, 3]
-    viridis  = cm.colormaps['viridis']
+    # cm.colormaps was added in matplotlib 3.5; use get_cmap for broader compatibility
+    try:
+        viridis = cm.colormaps['viridis']
+    except AttributeError:
+        viridis = cm.get_cmap('viridis')
     rgb_full = (viridis(norm)[:, :, :3] * 255).astype(np.uint8)
 
     # Resize to [128, 128, 3] with PIL bilinear
