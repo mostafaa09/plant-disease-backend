@@ -15,6 +15,22 @@ except ImportError:
 
 app = Flask(__name__)
 
+# Reject uploads larger than 10 MB
+app.config['MAX_CONTENT_LENGTH'] = 10 * 1024 * 1024
+
+# Optional bearer-token auth — set API_TOKEN env var to enable
+_API_TOKEN = os.environ.get('API_TOKEN', '')
+
+@app.before_request
+def _check_token():
+    if not _API_TOKEN:
+        return  # auth disabled
+    if request.path == '/health':
+        return  # always public
+    auth = request.headers.get('Authorization', '')
+    if not auth.startswith('Bearer ') or auth[7:] != _API_TOKEN:
+        return jsonify({'error': 'Unauthorized'}), 401
+
 # ── Plant disease model ───────────────────────────────────────────────────────
 MODEL_PATH  = os.environ.get('MODEL_PATH',  'plant_disease.tflite')
 LABELS_PATH = os.environ.get('LABELS_PATH', 'labels.txt')
@@ -29,19 +45,25 @@ with open(LABELS_PATH, 'r') as f:
 
 print(f"Disease model loaded: {MODEL_PATH} | Classes: {len(disease_labels)}")
 
-# ── Sound stress model ────────────────────────────────────────────────────────
+# ── Sound stress model (optional — server stays up if files are missing) ──────
 SOUND_MODEL_PATH  = os.environ.get('SOUND_MODEL_PATH',  'plant_stress_model.tflite')
 SOUND_LABELS_PATH = os.environ.get('SOUND_LABELS_PATH', 'sound_labels.json')
 
-sound_interpreter = Interpreter(model_path=SOUND_MODEL_PATH)
-sound_interpreter.allocate_tensors()
-sound_input  = sound_interpreter.get_input_details()
-sound_output = sound_interpreter.get_output_details()
+sound_interpreter = None
+sound_input       = None
+sound_output      = None
+sound_labels      = {}
 
-with open(SOUND_LABELS_PATH, 'r') as f:
-    sound_labels = json.load(f)  # {0: "dry", 1: "water"}
-
-print(f"Sound model loaded: {SOUND_MODEL_PATH} | Classes: {len(sound_labels)}")
+try:
+    sound_interpreter = Interpreter(model_path=SOUND_MODEL_PATH)
+    sound_interpreter.allocate_tensors()
+    sound_input  = sound_interpreter.get_input_details()
+    sound_output = sound_interpreter.get_output_details()
+    with open(SOUND_LABELS_PATH, 'r') as f:
+        sound_labels = json.load(f)
+    print(f"Sound model loaded: {SOUND_MODEL_PATH} | Classes: {len(sound_labels)}")
+except Exception as e:
+    print(f"[WARN] Sound model not loaded: {e}. /predict-sound will return 503.")
 
 
 # ── Helpers ───────────────────────────────────────────────────────────────────
@@ -89,11 +111,11 @@ def _sound_predict(wav_bytes: bytes) -> dict:
     norm = (mel_db - lo) / (hi - lo + 1e-9)
 
     # Apply viridis colormap → RGB uint8 [128, n_frames, 3]
-    viridis  = cm.get_cmap('viridis')
+    viridis  = cm.colormaps['viridis']
     rgb_full = (viridis(norm)[:, :, :3] * 255).astype(np.uint8)
 
     # Resize to [128, 128, 3] with PIL bilinear
-    img      = Image.fromarray(rgb_full).resize((128, 128), Image.BILINEAR)
+    img      = Image.fromarray(rgb_full).resize((128, 128), Image.Resampling.BILINEAR)
     tensor   = np.array(img, dtype=np.float32) / 255.0
     tensor   = np.expand_dims(tensor, axis=0)  # [1, 128, 128, 3]
 
@@ -115,9 +137,10 @@ def _sound_predict(wav_bytes: bytes) -> dict:
 @app.route('/health', methods=['GET'])
 def health():
     return jsonify({
-        'status':         'ok',
-        'disease_classes': len(disease_labels),
-        'sound_classes':   len(sound_labels),
+        'status':          'ok',
+        'disease_classes':  len(disease_labels),
+        'sound_available':  sound_interpreter is not None,
+        'sound_classes':    len(sound_labels),
     })
 
 
@@ -134,6 +157,8 @@ def predict():
 
 @app.route('/predict-sound', methods=['POST'])
 def predict_sound():
+    if sound_interpreter is None:
+        return jsonify({'error': 'Sound model not available on this server'}), 503
     if 'audio' not in request.files:
         return jsonify({'error': 'No audio file provided'}), 400
     try:
